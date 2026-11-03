@@ -1,0 +1,522 @@
+---
+title: "Final Paper"
+author: "STOR 320.02 Group 14"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse) 
+library(rvest)
+library(curl)
+library(modelr)
+library(purrr)
+library(broom)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(maps)
+library(knitr)
+library(kableExtra)
+library(DT)
+library(htmltools)
+
+#Put Necessary Libraries Here
+```
+
+```{r, include=FALSE}
+RMSE.func= function(actual,predict){
+ mse=mean((actual-predict)^2,na.rm=T)
+ rmse=sqrt(mse)
+ return(rmse)
+}
+
+std_unit.func = function(obs){
+  return((obs - mean(obs))/sd(obs))
+}
+```
+
+```{r, include=FALSE}
+doctor <- read.csv("https://data.chhs.ca.gov/dataset/05fee607-cea9-4bf1-8b53-20ca584748a3/resource/af88090e-b6f5-4f65-a7ea-d613e6569d96/download/2016-2023-imi-results-long-view.csv")  %>%
+        select(-3) #deselect the hospital name column
+expend = read.csv("https://bythenumbers.sco.ca.gov/api/views/miui-wb29/rows.csv?accessType=DOWNLOAD") %>% 
+          rename(COUNTY = !!1, Year = !!2, Totalexpend = !!3, Totalpop = !!4, PerCapita = !!5)
+
+expend = expend %>%
+            mutate(   lag_pop = lag(Totalpop,1),
+                      pop_change = Totalpop - lag_pop #population change from last year
+                      ) %>% select(-lag_pop)
+        
+doctor2 = doctor %>% select(-Hospital.Ratings) %>%
+                mutate_at(3,as.numeric) %>% 
+                mutate_at(5:9,as.numeric) %>% 
+                rename(Deaths = X..of.Deaths, Cases = X..of.Cases, ProCon = !!4, 
+               Year = YEAR, RAMR = !!5, ID = OSHPDID) %>%  #rename and making sure data are at correct type
+                filter(COUNTY != "AAAA") %>%   #no county names AAAA           
+              group_by(Year,COUNTY,ID,ProCon) %>% #since there is some duplication in the data
+                summarise(Cases = mean(Cases, na.rm = T),
+                          Deaths = mean(Deaths, na.rm  = T),
+                          RAMR = mean(RAMR, na.rm  = T)) %>%
+              ungroup() %>% group_by(Year, COUNTY, ProCon) %>% #calculate data for the whole county
+              summarise(Cases = sum(Cases, na.rm = T),
+                        Deaths = sum(Deaths, na.rm = T),
+                        RAMR = mean(RAMR, na.rm = T),
+                        n = n()) %>% ungroup()
+
+model_heartfailure = doctor2  %>%
+              filter(!is.na(Cases), ProCon == "Heart Failure") %>% #just predict Heart Failure
+              select(-ProCon) %>%
+            inner_join(expend) %>% #Join data
+            mutate(prop = Deaths/Cases*100,
+                   pop_change_prop = pop_change/Totalpop,
+                   residual = RAMR - prop,
+                    hospital_prop = n/Totalpop,
+                    Death_pop = Deaths/Totalpop,
+                    Cases_pop = Cases/Totalpop,
+                   log_cases_deaths = log(1 + Deaths) - log(1+Cases),
+                   pop_per_hos = Totalpop/n
+                   ) 
+#Mutate variables that has significant large or lower value compare to prop to standard unit
+
+
+```
+
+# INTRODUCTION
+
+The United States’ healthcare has always been the center of much attention. The American government still does not offer universal health coverage to its citizens, meaning the people have to pay for all expenses that insurance does not cover out of pocket. According to [The Commonwealth Fund](https://www.commonwealthfund.org/publications/issue-briefs/2023/jan/us-health-care-global-perspective-2022) it is reported that an individual in the US spends almost twice as much on health spending compared to other developed countries. Due to this, US citizens often disregard their health, refusing to schedule appointments or checkups as a way to avoid any bills that could potentially save them from debt. The problem doesn’t stop there either. From the [American Hospital Association](https://www.aha.org/costsofcaring#:~:text=America%27s%20hospitals%20and%20health%20systems%20are%20dedicated%20to%20providing%20high,the%20entire%20health%20care%20system) as a country, American hospitals are struggling financially as hospitals are using their resources on administration, medical and drug supplies as well as on labor. The amount of funding, equipment and staff at a given hospital can be the difference between life and death for American citizens and most are not even aware which hospital is the closest to them. 
+
+As part of the healthcare system of the United States of America, we were intrigued by a dataset presented to us about the mortality rates and quality ratings of hospitals. It contained information about procedures across hospitals in California and their data, such as the number of deaths, the number of cases, a rating based on the hospital’s performance, regarding a variety of different procedures and conditions. California is very diverse as well as the most populated of the fifty states, making this a great population to receive data from.
+
+After examining the dataset, our group decided to primarily focus on Mortality Rate, a variable we calculated using the number of deaths divided by the number of cases. We hypothesized that different county characteristics, such as expenditure, population, and access to healthcare, could influence the mortality rate. To explore this, we formulated our first research question: **can we observe a geographic relationship between these variables and mortality rate by examining the map of California?** We will specifically be looking into the mortality rate of Heart Failure, the most common procedure found during our initial data exploration. By answering this question, we hope to help counties identify specific factors they can target in order to improve their healthcare systems and reduce mortality rates. 
+
+For our second question, utilizing multiple modeling techniques: **can we predict the mortality rate using information such as the given Risk Adjusted Mortality Rate, number of deaths, number of cases, and other variables**? We also incorporated additional data, such as population and expenditure, sourced outside the initial dataset to uncover potential hidden correlations. By creating this model, we aim to provide an objective metric that sets performance targets, identifies areas needing improvement, and helps hospitals allocate resources more efficiently to enhance patient outcomes over time.
+
+# DATA
+
+Our primary dataset, California Hospital Inpatient Mortality Rates and Quality Ratings, came from [data.gov](https://catalog.data.gov/dataset/california-hospital-inpatient-mortality-rates-and-quality-ratings-8e21f) and was published by the California Department of Health Care Access and Information. The dataset contains information from 2016 to 2022 and was updated in November of 2024. The data provides risk-adjusted mortality rates, quality ratings, and number of deaths and cases for 6 medical conditions treated (Acute Stroke, Acute Myocardial Infarction, Heart Failure, Gastrointestinal Hemorrhage, Hip Fracture and Pneumonia) and 3 procedures performed (Carotid Endarterectomy, Pancreatic Resection, and Percutaneous Coronary Intervention) in California hospitals as well as for the state as a whole. We also pulled data from [California Open Data Portal](https://data.ca.gov/dataset/county-expenditures-per-capita) on population and  expenditure by county for 2003-2023.
+
+The variables we focused on for our analysis were County, Year, Number of Deaths, Number of Cases, Risk Adjusted Mortality Rate, Total Expenditure, and Total Population. Since our analysis is focused on Heart Failure, we only kept the data regarding this condition. Additionally, we cleaned the data to overcome a problem of the original data where some observations are recorded twice. The Number of Cases (`Cases`) and Number of Deaths (`Deaths`) variables show how many cases and deaths from Heart Failure each hospital saw in a certain year. Risk Adjusted Mortality Rate (`RAMR`), is a predictive mortality rate given by the government, owner of the data, that has been statistically adjusted to account for factors that influence the expected risk of death, like patient characteristics, severity of illness, hospital rating, and doctor experience. However, the information of which exact factors were used to calculate the `RAMR` or the process of collecting that data was not given. Total Expenditure (`Totalexpend`) and Total Population (`Totalpop`) reflect every county’s individual expenditure and population for each year. We used the summarize function to compile one value for each county in each year rather than for each hospital as the original data was presented, making every observation in our data a unique county and year combination. This allowed us to better see trends on the county level rather than for each hospital which show greater variability.
+
+We also constructed several new variables to help in our analysis: `n` = number of hospitals per county, `pop_change` = population change (current year - previous year), `prop` = number of deaths/number of cases, `pop_change_prop` = population change/total population, `residual` = RAMR - prop, `hospital_prop` = number of hospitals/total population, `Death_pop` = number of Death/ Total population, `Cases_pop` = number of cases/ Total Population, `pop_per_hos` = total population/ number of hospitals. We also explored how taking the log of many of these values might benefit our analysis. Of these, we found `log_cases_deaths` = log(Deaths/Cases) to be the most important in our modeling, as explained later. 
+
+The following table displays the most important variables used in our data exploration:
+
+```{r, fig.align = "center",echo = FALSE, warning=FALSE, message=FALSE}
+datatable(
+ model_heartfailure,
+  extensions = "FixedColumns",
+  options = list(
+  pageLength = 10,  # show 10 rows initially
+  scrollX = TRUE,   # allow scrolling left/right
+  fixedColumns = list(leftColumns = 2),
+  searchHighlight = TRUE  # highlight search matches
+  
+  ),
+  rownames = FALSE
+) %>%
+  formatRound(columns = c(5, 11, 12,13,14,15,16,17), digits = 6) %>%
+  formatRound(columns = c(18), digits = 0)
+```
+
+One key aspect that contributed to our results is `RAMR`, a provided variable representing the predicted mortality rate calculated by the dataset owner. Specifically, for our second question, `RAMR` helps us build a model that better fits the actual mortality rate (`prop`). Below, we present a plot showing the `residual` from predicting the mortality rate using `RAMR` across the years 2016 to 2023.
+
+```{r,fig.align = "center", echo=FALSE, warning=FALSE, message=FALSE}
+model_heartfailure %>%
+  ggplot(aes(x = factor(Year), y = residual)) +
+  geom_boxplot()+
+  labs(title = "Residuals Predicting by RAMR", x = "Year", y="Residual")+
+  theme_minimal()+
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+# RESULTS
+
+### Question 1: Geographic Relationship Between Different Variables and Mortality Rate
+
+```{r, fig.align = "center",echo = FALSE, warning=FALSE, message=FALSE}
+mortality_yearly <- model_heartfailure %>%
+  mutate(subregion = tolower(COUNTY)) %>%
+  select(Year, subregion, prop)
+counties <- map_data("county")
+CA_county <- subset(counties, region == "california")
+
+# Join the mortality data to map data
+CA_map_data <- left_join(CA_county, mortality_yearly, by = "subregion")
+
+# Plot
+p <- ggplot(CA_map_data, aes(x = long, y = lat, group = group, frame = Year)) +
+  geom_polygon(aes(fill = prop), color = NA) +  # remove white borders for smoother look
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(option = "inferno", direction = -1, na.value = "grey90", name = "Mortality Rate") +
+  theme_void() +
+  labs(title = "Heart Failure Mortality by County Over Time", fill = "Mortality Rate", y="Residual") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.1, size = 16, face = "bold"))
+
+# Make it interactive with animation
+htmltools::tags$div(
+  style = "height:610px; text-align:center; margin-bottom:20px;",
+  ggplotly(p, tooltip = c("subregion", "prop")) %>%
+    animation_opts(frame = 1500,  redraw = TRUE) %>%
+    animation_button(visible=FALSE) %>%
+    layout(
+      autosize = TRUE,  # reasonable width
+      height = 600,  # good height (map fills it naturally)
+      margin = list(t = 100)
+    )
+)
+
+
+```
+
+First, let's begin interpreting our Heart Failure Mortality map. Based on the map, we observe that counties with consistently low mortality rates are scattered across the state. While Southern and coastal counties are often shaded in light orange—indicating moderately low, though not the lowest, mortality rates—Northern California exhibits far greater variability, with counties frequently shifting in their relative mortality rankings over time. These observations led us to consider what underlying factors might be driving these differences. We began by investigating the relationship between mortality rates and population per hospital, based on the hypothesis that counties with fewer people per hospital might achieve better mortality outcomes, as hospitals can devote more attention and resources to each patient.
+
+::::: {style="display: flex; justify-content: center; align-items: center;"}
+<!-- Left side: R Plot -->
+
+::: {style="flex: 1; padding: 10px;"}
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=5, fig.height=5}
+# Your R code for the plot
+library(plotly)
+
+pop_per_hos_yearly <- model_heartfailure %>%
+  mutate(subregion = tolower(COUNTY)) %>%
+  select(Year, subregion, pop_per_hos)
+
+CA_map_data_pop <- left_join(CA_county, pop_per_hos_yearly, by = "subregion")
+
+p_pop <- ggplot(CA_map_data_pop, aes(x = long, y = lat, group = group, frame = Year)) +
+  geom_polygon(aes(fill = pop_per_hos), color = NA) +
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(option = "plasma", direction = -1, na.value = "grey90", name = "Pop per Hospital") +
+  theme_void() +
+  labs(title = "Pop per Hospital by County", fill = "Pop per Hospital") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+
+ggplotly(p_pop, tooltip = c("subregion", "pop_per_hos")) %>%
+  animation_opts(frame = 1500, redraw = TRUE) %>%
+  animation_button(visible=FALSE)
+```
+:::
+
+<!-- Right side: Static Image -->
+
+::: {style="flex: 1; padding: 10px;"}
+<img src="https://zeducorp.sirv.com/detailed-maps/california-map.jpg" width="400px"/>
+:::
+:::::
+
+[California State Map](https://www.state-maps.org/california-map/detailed-map.htm)
+
+In Northern California, this relationship appears particularly pronounced: counties with higher populations per hospital consistently show higher mortality rates across the years. This trend could be explained by the region’s mountainous geography, which limits transportation access and places a heavier burden on local hospitals. In contrast, Southern California does not exhibit a similarly consistent trend. Although some counties aligned with our initial expectations, others displayed the opposite: counties with a higher population per hospital sometimes achieved better mortality rates. This discrepancy led us to explore additional factors that can affect hospitals performance, such as hospital size, quality of care, and available resources.
+
+```{r, fig.align = "center", echo = FALSE, warning=FALSE, message=FALSE}
+# Prepare map data for PerCapita
+percapita_yearly <- model_heartfailure %>%
+  mutate(subregion = tolower(COUNTY)) %>%
+  select(Year, subregion, PerCapita)
+
+# Join the PerCapita data to the map
+CA_map_data_percapita <- left_join(CA_county, percapita_yearly, by = "subregion")
+
+# Plot
+p_percapita <- ggplot(CA_map_data_percapita, aes(x = long, y = lat, group = group, frame = Year)) +
+  geom_polygon(aes(fill = PerCapita), color = NA) +
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(option = "cividis", direction = -1, na.value = "grey90", name = "Per Capita Expenditure") +
+  theme_void() +
+  labs(title = "Per Capita Healthcare Expenditure by County Over Time", fill = "Per Capita Expenditure") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+# Interactive animated plot
+htmltools::tags$div(
+  style = "height:610px; text-align:center; margin-bottom:20px;",
+  ggplotly(p_percapita, tooltip = c("subregion", "PerCapita")) %>%
+    animation_opts(frame = 1500, redraw = TRUE) %>%
+    animation_button(visible=FALSE)%>%
+     layout(
+      autosize = TRUE,  # reasonable width
+      height = 600,  # good height (map fills it naturally)
+      margin = list(t = 100)
+    )
+)
+
+```
+
+Motivated by these observations, we next examined the relationship between mortality rate and Per Capita Expenditure—a factor that could indirectly capture differences in healthcare quality and accessibility. Here, we observed a clearer overall trend: counties with higher per capita healthcare spending generally exhibited lower mortality rates.
+
+However, this measure has its limitations. In coastal and Southern regions where living costs are high, elevated expenditure levels did not always translate into better health outcomes. It is possible that in these urbanized areas, a substantial portion of healthcare spending goes toward operational costs—such as facility maintenance and labor—rather than directly improving patient services.
+
+```{r, fig.align = "center",echo = FALSE, warning=FALSE, message=FALSE}
+# Prepare map data for Totalpop
+totalpop_yearly <- model_heartfailure %>%
+  mutate(subregion = tolower(COUNTY)) %>%
+  select(Year, subregion, Totalpop) %>% mutate(Totalpop = log(Totalpop))
+
+# Join the Totalpop data to the map
+CA_map_data_totalpop <- left_join(CA_county, totalpop_yearly, by = "subregion")
+
+# Plot
+p_totalpop <- ggplot(CA_map_data_totalpop, aes(x = long, y = lat, group = group, frame = Year)) +
+  geom_polygon(aes(fill = Totalpop), color = NA) +
+  coord_fixed(1.3) +
+  scale_fill_viridis_c(option = "inferno", direction = -1, na.value = "grey90", name = "Log of Total Population") +
+  theme_void() +
+  labs(title = "Log of Total Population by County Over Time", fill = "Log of Total Population") +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"))
+
+
+# Interactive animated plot
+htmltools::tags$div(
+  style = "height:610px; text-align:center; margin-bottom:20px;",
+  ggplotly(p_totalpop, tooltip = c("subregion", "Totalpop")) %>%
+    animation_opts(frame = 1500,  redraw = TRUE) %>%
+    animation_button(visible=FALSE) %>%
+      layout(
+      autosize = TRUE,  # reasonable width
+      height = 600,  # good height (map fills it naturally)
+      margin = list(t = 100)
+    )
+)
+
+
+```
+
+This prompted us to examine Total Population as another influencing factor. Given the vast difference in county populations (with some counties more than 100 times larger than others), we visualized the logarithm of Total Population to better compare across regions. Broadly speaking, counties with larger populations tended to show higher mortality rates, likely due to strained healthcare resources. However, within the more urbanized coastal and southern counties, the opposite pattern emerged: counties with larger populations often exhibited lower mortality rates. When we revisited the Per Capita Expenditure maps, we found that these populous coastal and southern counties maintained relatively similar per capita spending over the years. This consistency suggests that their lower mortality rates may be attributed to economies of scale. More populated counties, while having similar per capita expenditures, typically have greater total budgets, enabling investment in hospital infrastructure, specialized medical services, and more comprehensive care networks. These resources likely allow them to serve their populations more effectively. In contrast, smaller rural counties often rely on only a few small facilities, making them more vulnerable to resource shortages and staffing constraints.
+
+Overall our analysis highlights the complexity of the relationships between population, expenditure, healthcare infrastructure, and mortality outcomes. While some of our initial hypotheses did not fully hold across all regions, variables like Per Capita Expenditure and Total Population provided clearer insights, emphasizing the importance of healthcare investment and infrastructure in shaping patient outcomes.
+
+### Question 2: Predicting Mortality Rate Using Different Variables
+
+To explore our second question, we tried to build models that predict the mortality rate of heart failure for each county based on observations from the previous year. We evaluated the models by comparing their `Root Mean Squared Error (RMSE)` to the actual observed values using cross-validation techniques and by analyzing residual plots. To begin, we constructed the variable actual_prop, representing the following year’s mortality rate for each observation, allowing us to train models that predict future outcomes. We also ensured that all variables were on a comparable scale by standardizing those that differed significantly from the scale of the mortality rate.
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+lag_cases = model_heartfailure%>%
+                    mutate_at(c("Totalexpend","Totalpop", "Death_pop", "Cases_pop", "hospital_prop"), std_unit.func) %>% transmute(COUNTY = COUNTY, Year = Year -1, actual_prop = prop, RAMR) #actual prop denote the actual record will happen next year, we will use data to predict these actual record
+
+#Join table with record of next year(actual_record) and record of current year
+lag_data = lag_cases%>% inner_join(model_heartfailure%>%
+                    mutate_at(c("Totalexpend","Totalpop", "Death_pop", "Cases_pop", "hospital_prop"), std_unit.func) %>% select(-RAMR), by = c("Year","COUNTY"))
+
+datatable(
+ lag_data,
+  extensions = "FixedColumns",
+  options = list(
+  pageLength = 5,  # show 10 rows initially
+  scrollX = TRUE,   # allow scrolling left/right
+  fixedColumns = list(leftColumns = 2),
+  searchHighlight = TRUE  # highlight search matches
+  
+  ),
+  rownames = FALSE
+) %>%
+  formatRound(columns = c(3, 8,9, 12,13,14,15,16,17, 18), digits = 6) %>%
+  formatRound(columns = c(19), digits = 0) %>%
+  formatRound(columns = c(4), digits = 2)
+
+```
+
+Next, we identified variables that showed significant correlation with `actual_prop.` Initially, we considered `RAMR`, the predicted mortality rate provided by the dataset’s original source (a government technical entity). However, this mode yielded an RMSE of approximately 2.9, which was higher than some of our internally developed models. As a result, we decided to explore variables beyond `RAMR`. We began with 15 linear model combinations and later narrowed them down to 9, incorporating polynomial terms and interaction relationships. Ultimately, the most effective model combined Deaths/Population with `prop`, yielding an RMSE of 2.1 — substantially better than the baseline RAMR prediction.
+
+```{r, echo = FALSE, warning=FALSE, message=FALSE}
+DATA = na.omit(lag_data)
+DATA2 = DATA %>% mutate(id = sample(c(1:10), size = nrow(DATA), prob = rep(0.1,10), replace = T))
+OUTPUT = tibble()
+for(i in 1:10){
+  TRAIN = DATA2 %>% filter(id != i)
+  TEST = DATA2 %>% filter(id == i)
+  mod1=lm(actual_prop~  poly(prop,1)*poly(pop_change_prop,1), TRAIN)
+  mod2=lm(actual_prop~ poly(prop,1) ,data=TRAIN)
+  mod3=lm(actual_prop~ poly(n,2) + poly(pop_change,1) ,data= TRAIN)
+  mod4 = lm(actual_prop~ poly(hospital_prop,1) ,data=TRAIN)
+  mod5 =lm(actual_prop~ poly(Death_pop,1) ,data=TRAIN)
+  mod6 =lm(actual_prop~ poly(Cases_pop,5) ,data=TRAIN)
+  mod7=lm(actual_prop~ poly(log_cases_deaths,1) ,data=TRAIN)
+  mod8 = lm(actual_prop~prop*pop_change_prop ,data=TRAIN)
+  mod9 = lm(actual_prop~ poly(Death_pop,1) + prop ,data=TRAIN)
+  TEST2 = TEST %>% gather_predictions(mod1,mod2,mod3,mod4,mod5,mod6,mod7,mod8,mod9) %>% gather_residuals(mod1,mod2,mod3,mod4,mod5,mod6,mod7,mod8, mod9)
+  OUTPUT = TEST2 %>% rbind(OUTPUT)
+}
+final_results <- OUTPUT %>%
+  group_by(model) %>%
+  summarise(rmse = sqrt(mean(resid^2)))
+
+div(
+  style = "width: 400px; margin: auto;",  # limit table width and center it
+  datatable(
+    final_results,
+    colnames = c("Model", "RMSE"),
+    options = list(
+      dom = 't',
+      ordering = FALSE,
+      autoWidth = TRUE
+    ),
+    rownames = FALSE,
+    width = "auto"
+  ) %>%
+    formatRound(columns = 2, digits = 6) %>%
+    formatStyle(
+      columns = 1:2,
+      `width` = '150px'
+    )
+)
+```
+
+To evaluate model performance further, we examined residual plots. Unfortunately, none of the residual plots displayed a desirable random distribution, suggesting model misspecification. Upon deeper investigation, we discovered that our model heavily relied on the intercept, producing a constant prediction of approximately 3.1. This led us to reexamine the variables more carefully, aiming to identify those with a strong enough association with the mortality rate to address this issue.
+
+```{r, fig.align = "center",echo = FALSE, warning=FALSE, message=FALSE}
+
+
+OUTPUT %>% ggplot() + geom_point(aes(x = actual_prop, y = resid)) + facet_wrap(~model) +
+  labs(
+    title = "Residuals vs Actual Proportions for Each Model",
+    x = "Actual Proportion",
+    y = "Residual") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+We found that although `RAMR` initially has a high RMSE, this was largely due to the presence of two extreme outliers. After filtering out these outliers — each deviating more than four standard deviations from the mean — we reassessed `RAMR`, and its RMSE dramatically improved to around 1.43.
+
+```{r, fig.align = "center",echo = FALSE, warning=FALSE, message=FALSE}
+model_heartfailure %>% ggplot() + geom_histogram(aes(x = residual)) + theme_minimal() +
+  labs( title = "Residuals Distribution for RAMR", x="Residual", y="Count")+
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+Following this discovery, we recreated our models and identified the top 9 configurations for predicting mortality rate (based on RMSE). These included:
+
+-   mod1= RAMR + prop\*pop_change_prop
+
+-   mod2= RAMR \* prop 
+
+-   mod3= RAMR + n\^2 + pop_change
+
+-   mod4 = RAMR\^2 + hospital_prop
+
+-   mod5 =RAMR + Death_pop
+
+-   mod6 =RAMR + Cases_pop\^5
+
+-   mod7= RAMR + log_cases_deaths\^5
+
+-   mod8 = RAMR + prop\*pop_change_prop
+
+-   mod9 = RAMR + Death_pop + prop
+
+    ```{r, echo = FALSE, warning=FALSE, message=FALSE}
+    filtered_data = model_heartfailure %>% filter(residual < 15)
+
+    NEW_lag_cases = filtered_data %>% transmute(COUNTY = COUNTY, Year = Year -1, actual_prop = prop, RAMR) #actual prop denote the actual record will happen next year, we will use data to predict these actual record
+
+    #Join table with record of next year(actual_record) and record of current year
+    NEW_DATA = NEW_lag_cases %>% inner_join(filtered_data %>% select(-RAMR), by = c("Year","COUNTY"))
+
+    DATA2 = NEW_DATA %>% mutate(id = sample(c(1:10), size = nrow(NEW_DATA), prob = rep(0.1,10), replace = T))
+    OUTPUT2 = tibble()
+    for(i in 1:10){
+      TRAIN = DATA2 %>% filter(id != i)
+      TEST = DATA2 %>% filter(id == i)
+      mod1=lm(actual_prop~  RAMR + poly(prop,1)*poly(pop_change_prop,1), TRAIN)
+      mod2=lm(actual_prop~ RAMR * poly(prop,1) ,data=TRAIN)
+      mod3=lm(actual_prop~ RAMR + poly(n,2) + poly(pop_change,1) ,data= TRAIN)
+      mod4 = lm(actual_prop~ poly(RAMR,2) + poly(hospital_prop,1) ,data=TRAIN)
+      mod5 =lm(actual_prop~ RAMR + poly(Death_pop,1) ,data=TRAIN)
+      mod6 =lm(actual_prop~ RAMR + poly(Cases_pop,5) ,data=TRAIN)
+      mod7=lm(actual_prop~ RAMR + poly(log_cases_deaths,5) ,data=TRAIN)
+      mod8 = lm(actual_prop~RAMR + prop*pop_change_prop ,data=TRAIN)
+      mod9 = lm(actual_prop~ RAMR + poly(Death_pop,1) + prop ,data=TRAIN)
+      TEST2 = TEST %>% gather_predictions(mod1,mod2,mod3,mod4,mod5,mod6,mod7, mod8, mod9) %>% gather_residuals(mod1,mod2,mod3,mod4,mod5,mod6,mod7, mod8, mod9)
+      OUTPUT2 = TEST2 %>% rbind(OUTPUT2)
+    }
+    final_results2 <- OUTPUT2 %>%
+      group_by(model) %>%
+      summarise(rmse = sqrt(mean(resid^2)))
+
+    div(
+      style = "width: 400px; margin: auto;",  # limit table width and center it
+      datatable(
+        final_results2,
+        colnames = c("Model", "RMSE"),
+        options = list(
+          dom = 't',
+          ordering = FALSE,
+          autoWidth = TRUE
+        ),
+        rownames = FALSE,
+        width = "auto"  # this is the important part
+      ) %>%
+        formatRound(columns = 2, digits = 6) %>%
+        formatStyle(
+          columns = 1:2,
+          `width` = '150px'
+        )
+    )
+
+
+    ```
+
+We then analyzed the residual plots of these models. Since they appeared similar in structure, we chose to highlight the plots for `RAMR` and our best-performing model, `mod5`.
+
+```{r, fig.align="center", fig.width=16, fig.height=6, echo=FALSE, warning=FALSE, message=FALSE}
+
+# First plot
+p1 <- OUTPUT2 %>% 
+  filter(model == "mod5") %>%
+  ggplot() +
+  geom_point(aes(x = actual_prop, y = resid)) +
+  labs(title = "Residual Plot for Model5", x = "Actual Mortality Rate", y = "Residual") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Second plot
+p2 <- DATA2 %>% 
+  ggplot() +
+  geom_point(aes(x = actual_prop, y = residual)) +
+  labs(title = "Residual Plot for RAMR", x = "Actual Mortality Rate", y = "Residual") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Combine side-by-side
+
+```
+
+Model 5 achieved an RMSE of 1.13, which is approximately 20% better than `RAMR`. This model also demonstrated improved predictive performance for mortality rates ranging from 0 to 10, with reduced residual variance. For future improvements, we plan to examine the variables used to calculate **`RAMR`**, investigate the reasons behind the two outliers, and refine our model based on both our best-performing structure and the new insights we uncover.
+
+# CONCLUSION
+
+In this project, we addressed two main questions related to heart failure mortality rates across California counties. First, we explored how access to healthcare, measured through metrics like the number of hospitals and county-level expenditure, influenced mortality outcomes. While our initial hypothesis pointed toward simple relationships, such as fewer people per hospital leading to better mortality rates, our analysis revealed a more nuanced reality. Counties with higher per capita expenditure consistently demonstrated lower mortality rates, and when we consider counties with similar per capita expenditure, those with larger total populations were associated with better outcomes, likely reflecting stronger healthcare infrastructures.
+
+Second, we built and evaluated predictive models for heart failure mortality using available county-level data. After comparing multiple modeling approaches, we found that a model combining `RAMR` with additional accuracy variables like deaths per population provided significantly improved predictive accuracy over the original government-published `RAMR` scores. Importantly, identifying outliers drastically enhanced model performance, highlighting the importance of careful data preprocessing.
+
+Overall, our findings suggest that investment in healthcare resources and the underlying population structures of counties play critical roles in health outcomes. They also emphasize the potential value of referring predictive models beyond standard government metrics to better capture local realities. Our data can be beneficial to the health department or to the government of California as this pinpoints counties whose hospitals are producing higher mortality rates, and have them assist the hospitals in improving on their weakness. In doing so, the people of California will receive the best medical attention, regardless of their location. The people of California may also be interested in our results, especially with people who are prone to medical emergencies or to people who reside in counties that have higher mortality rates. Citizens should be informed of the conditions of their nearest hospitals as it can be crucial in their decision of where to start their family. In future work, access to more granular data—such as hospital-level quality metrics or patient demographics—could further improve prediction models. We were limited to just using the data of the state of California, so it would be interesting to compare the quality of hospitals and the mortality rate state by state or compare between countries. Moreover, by using logistic models or more advanced statistical practices, we could create different models that can potentially predict similar results. Thus, with these results, we hope that we can take a step forward in providing the best medical treatment to US citizens.
+
+<br>
